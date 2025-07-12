@@ -1,18 +1,31 @@
-# Lambda code with session-based conversation and payload persistence using DynamoDB for Claude via Bedrock
+# Lambda code with session-based conversation and payload persistence using Redis for Claude via Bedrock
 
 import json
 import boto3
 import urllib.request
 import urllib.error
-from boto3.dynamodb.conditions import Key
 import traceback
+import redis
+import os
 
 bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
-dynamodb = boto3.resource("dynamodb")
+
+# Redis configuration
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+REDIS_DB = int(os.environ.get("REDIS_DB", 0))
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
+
+redis_client = redis.StrictRedis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=REDIS_DB,
+    password=REDIS_PASSWORD,
+    decode_responses=True,
+)
 
 MODEL_ID = "anthropic.claude-v2:1"
 GETPLAN_URL = "https://ezk1xmweo1.execute-api.ap-south-1.amazonaws.com/Prod/getPlan"
-TABLE_NAME = "ClaudeTravelSessionTable"  # Replace with your actual DynamoDB table name
 
 INITIAL_PROMPT = """
 You are a helpful travel assistant. Your goal is to collect the required travel details from the user one step at a time in a friendly and conversational manner. You must gather the following information in this order:
@@ -54,27 +67,32 @@ Keep the destination, source and agent_id same as mentioned in the following JSO
 """
 
 def get_session_data(user_id, session_id):
-    table = dynamodb.Table(TABLE_NAME)
+    key = f"{user_id}:{session_id}"
     try:
-        response = table.get_item(Key={"user_id": user_id, "session_id": session_id})
-        item = response.get("Item", {})
+        data = redis_client.hgetall(key)
         print(f"[INFO] Retrieved session for user_id={user_id}, session_id={session_id}")
-        return item.get("conversation_history", f"\n\nHuman: {INITIAL_PROMPT}\n\nAssistant: Hi! I’m your travel assistant. How can I help you today?"), item.get("last_payload")
+        conversation = data.get("conversation_history")
+        payload_raw = data.get("last_payload")
+        payload = json.loads(payload_raw) if payload_raw else None
+        return (
+            conversation
+            or f"\n\nHuman: {INITIAL_PROMPT}\n\nAssistant: Hi! I’m your travel assistant. How can I help you today?",
+            payload,
+        )
     except Exception as e:
         print(f"[ERROR] Failed to get session data: {str(e)}")
-        return f"\n\nHuman: {INITIAL_PROMPT}\n\nAssistant: Hi! I’m your travel assistant. How can I help you today?", None
+        return (
+            f"\n\nHuman: {INITIAL_PROMPT}\n\nAssistant: Hi! I’m your travel assistant. How can I help you today?",
+            None,
+        )
 
 def save_session_data(user_id, session_id, conversation, payload=None):
-    table = dynamodb.Table(TABLE_NAME)
+    key = f"{user_id}:{session_id}"
     try:
-        item = {
-            "user_id": user_id,
-            "session_id": session_id,
-            "conversation_history": conversation
-        }
-        if payload:
-            item["last_payload"] = payload
-        table.put_item(Item=item)
+        mapping = {"conversation_history": conversation}
+        if payload is not None:
+            mapping["last_payload"] = json.dumps(payload)
+        redis_client.hset(key, mapping=mapping)
         print(f"[INFO] Session saved for user_id={user_id}, session_id={session_id}")
     except Exception as e:
         print(f"[ERROR] Failed to save session data: {str(e)}")
